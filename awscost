@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""awscost - monthly AWS spend broken down by service, for one profile.
+
+Reads Cost Explorer (UnblendedCost, MONTHLY, grouped by SERVICE) for the
+current month by default and prints every service above --min (10c).
+
+Profile resolution mirrors clouddevbox: a single configured profile is used
+as-is, more than one opens a bullet picker (needs a tty, so scripts pass
+--profile).
+
+Every run creates a throwaway venv (boto3 + bullet, its pip upgraded) under
+~/.awscost and removes it on exit, amun-style: nothing persists.
+
+Note: each Cost Explorer request costs $0.01.
+"""
+import argparse
+import calendar
+import datetime
+import os
+import shutil
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+VERSION = "1.1.0"
+
+# Cost Explorer is a global service with a us-east-1 endpoint; the profile's
+# own region is irrelevant here.
+CE_REGION = "us-east-1"
+DEFAULT_MIN = 0.10
+
+WORKDIR = Path.home() / ".awscost"
+# pid-scoped: os.execve keeps the pid, so the re-exec'd child owns this dir and
+# a concurrent run in another terminal can't delete our live interpreter.
+VENV = WORKDIR / f"venv-{os.getpid()}"
+
+
+class CliError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# throwaway venv bootstrap (amun-style: fresh slate every run, cleanup on exit)
+#
+# This preamble mirrors awsdashboard (and clouddevbox): keep select_profile and
+# make_session byte-identical across them, so a fix lands in both by diff.
+# ---------------------------------------------------------------------------
+def _cleanup():
+    shutil.rmtree(VENV, ignore_errors=True)
+    try:
+        WORKDIR.rmdir()  # only when no concurrent run still owns a venv here
+    except OSError:
+        pass
+
+
+def _bootstrap():
+    try:
+        import boto3  # noqa: F401
+        import bullet  # noqa: F401
+        return
+    except ImportError:
+        pass
+    if os.environ.get("AWSCOST_REEXEC"):
+        sys.exit("awscost: deps still missing after venv bootstrap")
+    _cleanup()
+    print("bootstrapping throwaway venv (boto3 + bullet)...", file=sys.stderr)
+    try:
+        subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True)
+        # venv's bundled pip lags PyPI and nags on every run; upgrade it
+        # in-venv only (never the interpreter's global pip)
+        subprocess.run([str(VENV / "bin" / "python"), "-m", "pip", "install",
+                        "--quiet", "--upgrade", "pip"], check=True)
+        subprocess.run([str(VENV / "bin" / "pip"), "install", "--quiet",
+                        "boto3", "bullet"], check=True)
+    except BaseException:
+        _cleanup()
+        raise
+    env = dict(os.environ, AWSCOST_REEXEC="1")
+    os.execve(str(VENV / "bin" / "python"),
+              [str(VENV / "bin" / "python"), os.path.abspath(__file__)] + sys.argv[1:], env)
+
+
+# ---------------------------------------------------------------------------
+# AWS session / profile selection
+# ---------------------------------------------------------------------------
+def select_profile():
+    """Resolve the AWS profile for runs that omit --profile: a single
+    configured profile is used as-is (tty or not); more than one opens an
+    interactive bullet picker, which needs a tty."""
+    import boto3
+    profiles = list(boto3.session.Session().available_profiles)
+    if not profiles:
+        raise CliError("no AWS profiles found in ~/.aws/config or ~/.aws/credentials")
+    if len(profiles) == 1:
+        print(f"using the only configured AWS profile: {profiles[0]}", file=sys.stderr)
+        return profiles[0]
+    if not sys.stdin.isatty():
+        raise CliError("--profile is required when stdin is not a tty")
+    from bullet import Bullet
+    return Bullet(
+        prompt="Select AWS Profile:",
+        choices=profiles,
+        indent=0,
+        align=5,
+        margin=1,
+        shift=0,
+        bullet="→",
+        pad_right=5,
+    ).launch()
+
+
+def make_session(profile, region=None):
+    """(session, caller-identity dict). The whole identity is returned, not
+    just the account: callers that need the caller ARN would otherwise pay a
+    second STS round trip."""
+    import boto3
+    import botocore.exceptions as bex
+    sso_errors = tuple(getattr(bex, n) for n in
+                       ("SSOTokenLoadError", "TokenRetrievalError",
+                        "UnauthorizedSSOTokenError", "SSOError")
+                       if hasattr(bex, n))
+    try:
+        session = boto3.Session(profile_name=profile, region_name=region)
+        return session, session.client("sts").get_caller_identity()
+    except bex.ProfileNotFound:
+        raise CliError(f"AWS profile '{profile}' not found in ~/.aws/config or ~/.aws/credentials")
+    except sso_errors:
+        raise CliError(f"SSO credentials for '{profile}' are missing or expired; run:\n"
+                       f"  aws sso login --profile {profile}")
+    except bex.NoCredentialsError:
+        raise CliError(f"no credentials available for profile '{profile}'")
+    except bex.ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if "Expired" in code or code in ("InvalidClientTokenId", "AccessDenied"):
+            raise CliError(f"credentials for '{profile}' were rejected ({code}); if this is an "
+                           f"SSO profile, run: aws sso login --profile {profile}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Cost Explorer
+# ---------------------------------------------------------------------------
+def month_range(month):
+    """(start, end, label) for --month YYYY-MM, else the current month.
+    Cost Explorer's End is exclusive; for the running month it stops at
+    tomorrow so today's partial usage is included."""
+    today = datetime.date.today()
+    if month:
+        try:
+            year, mon = (int(x) for x in month.split("-"))
+            start = datetime.date(year, mon, 1)
+        except ValueError:
+            raise CliError(f"--month must be YYYY-MM, got '{month}'")
+        if start > today.replace(day=1):
+            raise CliError(f"--month {month} is in the future")
+        end = start + datetime.timedelta(days=calendar.monthrange(year, mon)[1])
+        end = min(end, today + datetime.timedelta(days=1))
+    else:
+        start = today.replace(day=1)
+        end = today + datetime.timedelta(days=1)
+    return start.isoformat(), end.isoformat(), start.strftime("%B %Y")
+
+
+def costs_by_service(session, start, end):
+    """[(service, amount)] descending, plus the currency unit. Sums every
+    ResultsByTime bucket in case Cost Explorer splits the period."""
+    import botocore.exceptions as bex
+    ce = session.client("ce", region_name=CE_REGION)
+    totals, unit, token = {}, "USD", None
+    while True:
+        kwargs = dict(
+            TimePeriod={"Start": start, "End": end},
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost"],
+            GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+        )
+        if token:
+            kwargs["NextPageToken"] = token
+        try:
+            resp = ce.get_cost_and_usage(**kwargs)
+        except bex.ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code == "AccessDeniedException":
+                raise CliError("this profile lacks ce:GetCostAndUsage (Cost Explorer). "
+                               "It must also be enabled once in the billing console, "
+                               "by the payer account.")
+            if code == "DataUnavailableException":
+                raise CliError("Cost Explorer has no data for that period yet")
+            raise CliError(f"Cost Explorer call failed ({code}): "
+                           f"{e.response.get('Error', {}).get('Message', e)}")
+        for bucket in resp.get("ResultsByTime", []):
+            for group in bucket.get("Groups", []):
+                metric = group["Metrics"]["UnblendedCost"]
+                unit = metric.get("Unit") or unit
+                totals[group["Keys"][0]] = totals.get(group["Keys"][0], 0.0) + float(metric["Amount"])
+        token = resp.get("NextPageToken")
+        if not token:
+            break
+    return sorted(totals.items(), key=lambda kv: kv[1], reverse=True), unit
+
+
+def report(rows, unit, minimum, label, profile, account):
+    # abs(): credits and refunds come back negative, and a -50.00 credit is the
+    # most interesting line on the report - never let the min filter hide it.
+    shown = [(svc, amt) for svc, amt in rows if abs(amt) >= minimum]
+    grand = sum(amt for _, amt in rows)
+    print(f"\n{label} - profile {profile} (account {account}), {unit}")
+    if not shown:
+        print(f"  nothing above {minimum:.2f} (total {grand:,.2f})")
+        return
+    width = max(len(svc) for svc, _ in shown)
+    for svc, amt in shown:
+        print(f"  {svc:<{width}}  {amt:>10,.2f}")
+    hidden_count = len(rows) - len(shown)
+    hidden = grand - sum(amt for _, amt in shown)
+    print(f"  {'-' * (width + 12)}")
+    print(f"  {'TOTAL':<{width}}  {grand:>10,.2f}")
+    # keyed off the count, not the amount: a hidden set that nets to ~zero
+    # (or negative) is still a hidden set worth mentioning
+    if hidden_count:
+        print(f"  ({hidden_count} service(s) below {minimum:.2f} "
+              f"omitted, {hidden:,.2f} together)")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="awscost",
+        description="monthly AWS cost by service (Cost Explorer, ~$0.01 per run)")
+    p.add_argument("--version", action="version", version=f"awscost {VERSION}")
+    p.add_argument("--profile", help="AWS profile (default: the only one, else a picker)")
+    p.add_argument("--month", metavar="YYYY-MM",
+                   help="month to report (default: the current, partial month)")
+    p.add_argument("--min", dest="minimum", type=float, default=DEFAULT_MIN,
+                   metavar="AMOUNT",
+                   help=f"hide services below this amount (default: {DEFAULT_MIN:.2f})")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    start, end, label = month_range(args.month)
+    profile = args.profile or select_profile()
+    session, ident = make_session(profile, CE_REGION)
+    rows, unit = costs_by_service(session, start, end)
+    report(rows, unit, args.minimum, label, profile, ident["Account"])
+    return 0
+
+
+if __name__ == "__main__":
+    # --version and --help must not pay for a venv: `gear info` runs
+    # `awscost --version` with an 8s timeout, and a bootstrap blows past it.
+    # build_parser() imports nothing beyond argparse, so --help is safe here.
+    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+        print(f"awscost {VERSION}")
+        sys.exit(0)
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        build_parser().print_help()
+        sys.exit(0)
+    _bootstrap()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    try:
+        sys.exit(main())
+    except CliError as e:
+        print(f"awscost: {e}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
+    finally:
+        _cleanup()

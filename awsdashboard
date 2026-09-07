@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""awsdashboard - open the AWS console as a role, from a CLI profile.
+
+Resolves an AWS profile (the only one, else a bullet picker), lists the roles
+that profile can actually assume, assumes the one you pick and prints a
+federated sign-in URL for the console. --open launches it.
+
+Supersedes GonzaloAlvarez/pyawsah: paginated role listing, roles filtered by
+their trust policy, real role ARNs (so role paths and other accounts work), a
+session name that satisfies the STS charset, and no illegal SessionDuration on
+AssumeRole-derived credentials.
+
+Every run creates a throwaway venv (boto3 + bullet, its pip upgraded) under
+~/.awsdashboard and removes it on exit, amun-style: nothing persists.
+
+Every call this makes is free: sts, iam:ListRoles and signin.aws.amazon.com.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+DEFAULT_ISSUER = "awsdashboard"
+DEFAULT_DURATION = 3600
+# the console caps a federated session at 12h regardless of the role's own max
+CONSOLE_MAX_DURATION = 43200
+MIN_DURATION = 900
+FEDERATION_ENDPOINT = "https://signin.aws.amazon.com/federation"
+SERVICE_ROLE_PATH = "/aws-service-role/"
+
+WORKDIR = Path.home() / ".awsdashboard"
+# pid-scoped: os.execve keeps the pid, so the re-exec'd child owns this dir and
+# a concurrent run in another terminal can't delete our live interpreter.
+VENV = WORKDIR / f"venv-{os.getpid()}"
+
+
+class CliError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# throwaway venv bootstrap (amun-style: fresh slate every run, cleanup on exit)
+#
+# This preamble mirrors awscost (and clouddevbox): keep select_profile and
+# make_session byte-identical across them, so a fix lands in both by diff.
+# ---------------------------------------------------------------------------
+def _cleanup():
+    shutil.rmtree(VENV, ignore_errors=True)
+    try:
+        WORKDIR.rmdir()  # only when no concurrent run still owns a venv here
+    except OSError:
+        pass
+
+
+def _bootstrap():
+    try:
+        import boto3  # noqa: F401
+        import bullet  # noqa: F401
+        return
+    except ImportError:
+        pass
+    if os.environ.get("AWSDASHBOARD_REEXEC"):
+        sys.exit("awsdashboard: deps still missing after venv bootstrap")
+    _cleanup()
+    print("bootstrapping throwaway venv (boto3 + bullet)...", file=sys.stderr)
+    try:
+        subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True)
+        # venv's bundled pip lags PyPI and nags on every run; upgrade it
+        # in-venv only (never the interpreter's global pip)
+        subprocess.run([str(VENV / "bin" / "python"), "-m", "pip", "install",
+                        "--quiet", "--upgrade", "pip"], check=True)
+        subprocess.run([str(VENV / "bin" / "pip"), "install", "--quiet",
+                        "boto3", "bullet"], check=True)
+    except BaseException:
+        _cleanup()
+        raise
+    env = dict(os.environ, AWSDASHBOARD_REEXEC="1")
+    os.execve(str(VENV / "bin" / "python"),
+              [str(VENV / "bin" / "python"), os.path.abspath(__file__)] + sys.argv[1:], env)
+
+
+# ---------------------------------------------------------------------------
+# AWS session / profile selection
+# ---------------------------------------------------------------------------
+def select_profile():
+    """Resolve the AWS profile for runs that omit --profile: a single
+    configured profile is used as-is (tty or not); more than one opens an
+    interactive bullet picker, which needs a tty."""
+    import boto3
+    profiles = list(boto3.session.Session().available_profiles)
+    if not profiles:
+        raise CliError("no AWS profiles found in ~/.aws/config or ~/.aws/credentials")
+    if len(profiles) == 1:
+        print(f"using the only configured AWS profile: {profiles[0]}", file=sys.stderr)
+        return profiles[0]
+    if not sys.stdin.isatty():
+        raise CliError("--profile is required when stdin is not a tty")
+    from bullet import Bullet
+    return Bullet(
+        prompt="Select AWS Profile:",
+        choices=profiles,
+        indent=0,
+        align=5,
+        margin=1,
+        shift=0,
+        bullet="→",
+        pad_right=5,
+    ).launch()
+
+
+def make_session(profile, region=None):
+    """(session, caller-identity dict). The whole identity is returned, not
+    just the account: callers that need the caller ARN would otherwise pay a
+    second STS round trip."""
+    import boto3
+    import botocore.exceptions as bex
+    sso_errors = tuple(getattr(bex, n) for n in
+                       ("SSOTokenLoadError", "TokenRetrievalError",
+                        "UnauthorizedSSOTokenError", "SSOError")
+                       if hasattr(bex, n))
+    try:
+        session = boto3.Session(profile_name=profile, region_name=region)
+        return session, session.client("sts").get_caller_identity()
+    except bex.ProfileNotFound:
+        raise CliError(f"AWS profile '{profile}' not found in ~/.aws/config or ~/.aws/credentials")
+    except sso_errors:
+        raise CliError(f"SSO credentials for '{profile}' are missing or expired; run:\n"
+                       f"  aws sso login --profile {profile}")
+    except bex.NoCredentialsError:
+        raise CliError(f"no credentials available for profile '{profile}'")
+    except bex.ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if "Expired" in code or code in ("InvalidClientTokenId", "AccessDenied"):
+            raise CliError(f"credentials for '{profile}' were rejected ({code}); if this is an "
+                           f"SSO profile, run: aws sso login --profile {profile}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# ARNs and trust policies
+# ---------------------------------------------------------------------------
+def partition_of(arn):
+    """'aws', 'aws-us-gov' or 'aws-cn', read off an ARN rather than assumed."""
+    parts = (arn or "").split(":")
+    return parts[1] if len(parts) > 3 and parts[1] else "aws"
+
+
+def normalize_caller_arn(arn):
+    """An assumed-role caller ARN as its underlying role ARN.
+
+    arn:aws:sts::123:assumed-role/Admin/session -> arn:aws:iam::123:role/Admin
+
+    Trust policies name the *role*, never the assumed-role session, so without
+    this every trust-policy comparison fails when chaining from a role.
+    """
+    m = re.match(r"^arn:([^:]+):sts::(\d+):assumed-role/([^/]+)/", arn or "")
+    if not m:
+        return arn
+    return f"arn:{m.group(1)}:iam::{m.group(2)}:role/{m.group(3)}"
+
+
+def parse_policy_doc(doc):
+    """A trust policy as a dict. botocore usually URL-decodes and json-loads
+    these already; tolerate the raw forms too, and never raise - an unreadable
+    document just means 'cannot prove this is assumable'."""
+    if isinstance(doc, dict):
+        return doc
+    if isinstance(doc, str):
+        try:
+            return json.loads(urllib.parse.unquote(doc))
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+def _as_list(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def can_assume(doc, caller_arn, account_id):
+    """Whether a trust policy plausibly lets caller_arn assume the role.
+
+    Advisory only: Condition blocks are NOT evaluated (an MFA-gated role reads
+    as assumable and then fails at AssumeRole with a clear error), NotPrincipal
+    is ignored, and the caller's own identity-based sts:AssumeRole permission is
+    invisible from here. Hence --all-roles and the empty-result fallback.
+    """
+    caller = normalize_caller_arn(caller_arn)
+    partition = partition_of(caller_arn)
+    roots = {"*", account_id,
+             f"arn:{partition}:iam::{account_id}:root",
+             caller}
+    for stmt in _as_list(doc.get("Statement")):
+        if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow":
+            continue
+        actions = {str(a).lower() for a in _as_list(stmt.get("Action"))}
+        if not (actions & {"sts:assumerole", "sts:*", "*"}):
+            continue
+        principal = stmt.get("Principal")
+        if not isinstance(principal, dict):
+            continue
+        # Service-only / Federated-only statements are not us
+        if any(p in roots for p in _as_list(principal.get("AWS"))):
+            return True
+    return False
+
+
+def is_service_linked(role):
+    return role.get("Path", "/").startswith(SERVICE_ROLE_PATH)
+
+
+def list_roles(session):
+    """Every non-service-linked role in the account, paginated (a single
+    list_roles call silently truncates at 100)."""
+    import botocore.exceptions as bex
+    iam = session.client("iam")
+    roles = []
+    try:
+        for page in iam.get_paginator("list_roles").paginate():
+            roles.extend(r for r in page.get("Roles", []) if not is_service_linked(r))
+    except bex.ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if "AccessDenied" in code:
+            raise CliError("this profile lacks iam:ListRoles, so roles cannot be discovered:\n"
+                           "  pass --role <name-or-arn> to name one directly, or\n"
+                           "  pass --federation to sign in as the profile's own identity")
+        raise CliError(f"iam:ListRoles failed ({code}): "
+                       f"{e.response.get('Error', {}).get('Message', e)}")
+    return sorted(roles, key=lambda r: r.get("RoleName", ""))
+
+
+def filter_assumable(roles, caller_arn, account_id):
+    return [r for r in roles
+            if can_assume(parse_policy_doc(r.get("AssumeRolePolicyDocument")),
+                          caller_arn, account_id)]
+
+
+def role_choices(roles):
+    """(labels, {label: role}). Labels are role names, except that names
+    duplicated across different paths are labelled by full ARN so the picker
+    stays unambiguous."""
+    seen = {}
+    for r in roles:
+        seen[r.get("RoleName", "")] = seen.get(r.get("RoleName", ""), 0) + 1
+    choices = {}
+    for r in roles:
+        name = r.get("RoleName", "")
+        label = r.get("Arn", name) if seen[name] > 1 else name
+        choices[label] = r
+    labels = sorted(choices)
+    return labels, choices
+
+
+def pick_role(roles):
+    labels, choices = role_choices(roles)
+    if not sys.stdin.isatty():
+        raise CliError("--role is required when stdin is not a tty")
+    from bullet import Bullet
+    label = Bullet(
+        prompt="Select Role:",
+        choices=labels,
+        indent=0,
+        align=5,
+        margin=1,
+        shift=0,
+        bullet="→",
+        pad_right=5,
+    ).launch()
+    return choices[label]
+
+
+def resolve_role_arn(value, account_id, partition):
+    """A full role ARN from --role. A value that is already an ARN is used
+    verbatim; a bare name is assumed to live at the root path of this account
+    (a role under a path, or in another account, needs its full ARN)."""
+    if value.startswith("arn:"):
+        return value
+    return f"arn:{partition}:iam::{account_id}:role/{value.lstrip('/')}"
+
+
+_SESSION_NAME_BAD = re.compile(r"[^A-Za-z0-9+=,.@_-]")
+
+
+def sanitize_session_name(*parts, limit=64):
+    r"""A name STS will accept: 2-limit characters from [A-Za-z0-9+=,.@_-].
+
+    The class is spelled out rather than using \w, which is Unicode-aware in
+    Python 3 and would pass 'café' straight into a call that rejects it.
+    Truncation happens before the trailing-separator strip so it can never
+    leave a dangling '-' or '.'.
+    """
+    name = _SESSION_NAME_BAD.sub("-", "-".join(p for p in parts if p))
+    name = name[:limit].rstrip("-.")
+    return name if len(name) >= 2 else DEFAULT_ISSUER[:limit]
+
+
+def clamp_duration(requested, role_max=None):
+    """Clamp a requested session length to what both the role and the console
+    will accept. Returns (seconds, note-or-None)."""
+    ceiling = min(role_max or DEFAULT_DURATION, CONSOLE_MAX_DURATION)
+    if requested > ceiling:
+        return ceiling, (f"requested {requested}s exceeds the maximum for this session "
+                         f"({ceiling}s); using {ceiling}s")
+    if requested < MIN_DURATION:
+        return MIN_DURATION, (f"requested {requested}s is below the {MIN_DURATION}s minimum; "
+                              f"using {MIN_DURATION}s")
+    return requested, None
+
+
+def console_destination(region, override=None):
+    """Where the console lands. pyawsah always sent you to the global (us-east-1)
+    console; honour the profile's region instead."""
+    if override:
+        return override
+    if region:
+        return f"https://{region}.console.aws.amazon.com/console/home?region={region}"
+    return "https://console.aws.amazon.com/"
+
+
+# ---------------------------------------------------------------------------
+# credentials -> federated sign-in URL
+# ---------------------------------------------------------------------------
+def assume_role_creds(session, role_arn, session_name, duration):
+    import botocore.exceptions as bex
+    sts = session.client("sts")
+    try:
+        return sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name,
+                               DurationSeconds=duration)["Credentials"]
+    except bex.ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        msg = e.response.get("Error", {}).get("Message", str(e))
+        if code == "ValidationError" and duration != DEFAULT_DURATION:
+            # the role's MaxSessionDuration is unknown for a hand-passed --role
+            print(f"awsdashboard: {duration}s rejected ({msg}); retrying at "
+                  f"{DEFAULT_DURATION}s", file=sys.stderr)
+            return sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name,
+                                   DurationSeconds=DEFAULT_DURATION)["Credentials"]
+        if "AccessDenied" in code:
+            raise CliError(f"not allowed to assume {role_arn}: the role's trust policy must "
+                           f"name you, and your identity needs sts:AssumeRole on it.\n  {msg}")
+        raise CliError(f"sts:AssumeRole failed ({code}): {msg}")
+
+
+def federation_creds(session, name, duration, partition):
+    """sts:GetFederationToken - signs in as the profile's own identity rather
+    than a role. Needs long-term IAM user credentials.
+
+    The AdministratorAccess policy is not an escalation: the federated session
+    gets the *intersection* of this policy and the IAM user's own permissions,
+    so passing it simply declines to narrow them further.
+    """
+    import botocore.exceptions as bex
+    sts = session.client("sts")
+    try:
+        return sts.get_federation_token(
+            Name=name,
+            DurationSeconds=duration,
+            PolicyArns=[{"arn": f"arn:{partition}:iam::aws:policy/AdministratorAccess"}],
+        )["Credentials"]
+    except bex.ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        msg = e.response.get("Error", {}).get("Message", str(e))
+        if "session credentials" in msg or "GetFederationToken" in msg:
+            raise CliError("--federation needs long-term IAM user credentials; this profile "
+                           "is already a temporary/role session.\n  " + msg)
+        if "AccessDenied" in code:
+            raise CliError(f"not allowed to call sts:GetFederationToken.\n  {msg}")
+        raise CliError(f"sts:GetFederationToken failed ({code}): {msg}")
+
+
+def signin_token_url(creds, session_duration=None):
+    """The getSigninToken URL for a set of temporary credentials.
+
+    SessionDuration is legal ONLY when the Session credentials came from
+    GetFederationToken. With AssumeRole credentials the endpoint rejects it,
+    and the console session instead lasts as long as the role session - so
+    callers on the role path must leave session_duration None. (pyawsah always
+    sent SessionDuration=43200; this is that bug.)
+    """
+    session = json.dumps({"sessionId": creds["AccessKeyId"],
+                          "sessionKey": creds["SecretAccessKey"],
+                          "sessionToken": creds["SessionToken"]})
+    params = {"Action": "getSigninToken", "Session": session}
+    if session_duration:
+        params["SessionDuration"] = int(session_duration)
+    return FEDERATION_ENDPOINT + "?" + urllib.parse.urlencode(params)
+
+
+def login_url(signin_token, issuer, destination):
+    return FEDERATION_ENDPOINT + "?" + urllib.parse.urlencode(
+        {"Action": "login", "Issuer": issuer,
+         "Destination": destination, "SigninToken": signin_token})
+
+
+def signin_token(url):
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            body = json.load(r)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace").strip()
+        except OSError:
+            pass
+        raise CliError(f"the federation endpoint returned HTTP {e.code}: {detail or e.reason}")
+    except urllib.error.URLError as e:
+        raise CliError(f"could not reach {FEDERATION_ENDPOINT}: {e.reason}")
+    except ValueError:
+        raise CliError("the federation endpoint returned a non-JSON response")
+    if "SigninToken" not in body:
+        raise CliError(f"no SigninToken in the federation response: {body}")
+    return body["SigninToken"]
+
+
+# ---------------------------------------------------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="awsdashboard",
+        description="print a federated AWS console sign-in URL for a role")
+    p.add_argument("--version", action="version", version=f"awsdashboard {VERSION}")
+    p.add_argument("--profile", help="AWS profile (default: the only one, else a picker)")
+    p.add_argument("--role", metavar="NAME|ARN",
+                   help="role to assume (default: pick from the assumable ones)")
+    p.add_argument("--all-roles", action="store_true",
+                   help="offer every role, not just those whose trust policy names you")
+    p.add_argument("--federation", action="store_true",
+                   help="sign in as the profile's own identity (sts:GetFederationToken, "
+                        "needs long-term IAM user credentials) instead of a role")
+    p.add_argument("--duration", type=int, default=DEFAULT_DURATION, metavar="SECONDS",
+                   help=f"session length (default: {DEFAULT_DURATION}; the console caps "
+                        f"at {CONSOLE_MAX_DURATION}, a role at its MaxSessionDuration)")
+    p.add_argument("--destination", metavar="URL",
+                   help="console page to land on (default: the profile region's console home)")
+    p.add_argument("--issuer", default=DEFAULT_ISSUER,
+                   help=f"where the console returns you on sign-out (default: {DEFAULT_ISSUER})")
+    p.add_argument("--open", dest="open_browser", action="store_true",
+                   help="also open the URL in a browser")
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.federation and (args.role or args.all_roles):
+        parser.error("--federation signs in as the profile itself; it takes no role")
+
+    profile = args.profile or select_profile()
+    session, ident = make_session(profile)
+    account_id, caller_arn = ident["Account"], ident.get("Arn", "")
+    partition = partition_of(caller_arn)
+
+    if args.federation:
+        duration, note = clamp_duration(args.duration, CONSOLE_MAX_DURATION)
+        if note:
+            print(f"awsdashboard: {note}", file=sys.stderr)
+        # GetFederationToken's Name is capped at 32 chars, not 64
+        name = sanitize_session_name(profile, limit=32)
+        creds = federation_creds(session, name, duration, partition)
+        token_url = signin_token_url(creds, session_duration=duration)
+        as_who = f"{caller_arn or profile} (federated)"
+    else:
+        if args.role:
+            role_arn = resolve_role_arn(args.role, account_id, partition)
+            role_name, role_max = args.role, None
+        else:
+            roles = list_roles(session)
+            if not roles:
+                raise CliError("no roles found in this account; pass --federation to sign in "
+                               "as the profile's own identity")
+            offered = roles if args.all_roles else filter_assumable(roles, caller_arn, account_id)
+            if not offered:
+                # never dead-end on a heuristic that cannot see Conditions
+                print(f"awsdashboard: no role's trust policy names you; offering all "
+                      f"{len(roles)} roles (trust conditions are not evaluated)",
+                      file=sys.stderr)
+                offered = roles
+            role = pick_role(offered)
+            role_arn, role_name = role["Arn"], role["RoleName"]
+            role_max = role.get("MaxSessionDuration")
+        duration, note = clamp_duration(args.duration, role_max)
+        if note:
+            print(f"awsdashboard: {note}", file=sys.stderr)
+        name = sanitize_session_name(profile, role_name)
+        creds = assume_role_creds(session, role_arn, name, duration)
+        # no session_duration: illegal with AssumeRole credentials
+        token_url = signin_token_url(creds)
+        as_who = role_arn
+
+    print(f"profile {profile} (account {account_id}) as {as_who}", file=sys.stderr)
+    url = login_url(signin_token(token_url), args.issuer,
+                    console_destination(session.region_name, args.destination))
+    print(f"this URL is a live credential valid for {duration}s - do not share or log it",
+          file=sys.stderr)
+    print(url)
+    if args.open_browser:
+        import webbrowser
+        if not webbrowser.open(url):
+            print("awsdashboard: no browser handler found; the URL is above", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    # --version and --help must not pay for a venv: `gear info` runs
+    # `awsdashboard --version` with an 8s timeout, and a bootstrap blows past
+    # it. build_parser() imports nothing beyond argparse, so --help is safe.
+    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+        print(f"awsdashboard {VERSION}")
+        sys.exit(0)
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        build_parser().print_help()
+        sys.exit(0)
+    _bootstrap()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    try:
+        sys.exit(main())
+    except CliError as e:
+        print(f"awsdashboard: {e}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
+    finally:
+        _cleanup()
